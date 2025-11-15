@@ -15,6 +15,7 @@ class Phi4:
         model_path: str = "microsoft/Phi-4-mini-instruct",
         system_prompt_host: str = "",
         system_prompt_chat: str = "",
+        max_new_tokens: int = 512,
         context_size_limit: int = 100000,
         system_prompt_summary: str = "",
         device: str = "auto",
@@ -31,6 +32,7 @@ class Phi4:
         self.generation_config = GenerationConfig.from_pretrained(model_path)
         self.history_host: list[dict[str, str]] = [{"role": "system", "content": system_prompt_host}]
         self.history_chat: dict[str, list[dict[str, str]]] = defaultdict(lambda: [{"role": "system", "content": system_prompt_chat}])
+        self.max_new_tokens = max_new_tokens
         self.context_size_limit = context_size_limit
         self.system_prompt_summary = system_prompt_summary
 
@@ -42,20 +44,20 @@ class Phi4:
     def summurize(self, history: list[dict[str, str]]) -> str:
         summary = [{"role": "system", "content": self.system_prompt_summary}] + history
         streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True)
-        streamer_thread = threading.Thread(target=Phi4.progress, args=(streamer, "Summurizing", 512))
+        streamer_thread = threading.Thread(target=Phi4.progress, args=(streamer, "Summurizing", self.max_new_tokens))
         streamer_thread.start()
         inputs = self.tokenizer.apply_chat_template(summary, add_generation_prompt=True, return_dict=True, return_tensors="pt").to(self.model.device)
-        out = self.model.generate(**inputs, max_new_tokens=1024, generation_config=self.generation_config, streamer=streamer)
+        out = self.model.generate(**inputs, max_new_tokens=self.max_new_tokens, generation_config=self.generation_config, streamer=streamer)
         streamer_thread.join()
         text = self.tokenizer.decode(out[0][len(inputs["input_ids"][0]) :], skip_special_tokens=True)
         print(text, "\n")
         return text
 
-    def process_host(self, message: Message) -> tuple[MessageType, Any]:
-        if message.message_type != MessageType.TEXT:
-            return MessageType.NONE, None
+    def process_host(self, type: MessageType, content: Any) -> list[tuple[MessageType, Any]]:
+        if type != MessageType.TEXT:
+            return [(MessageType.NONE, None)]
 
-        self.history_host.append({"role": "user", "content": message.content})
+        self.history_host.append({"role": "user", "content": content})
         try:
             with torch.inference_mode():
                 inputs = self.tokenizer.apply_chat_template(self.history_host, add_generation_prompt=True, return_dict=True, return_tensors="pt").to(
@@ -81,16 +83,17 @@ class Phi4:
                 streamer_thread.join()
                 text = self.tokenizer.decode(out[0][len(inputs["input_ids"][0]) :], skip_special_tokens=True)
                 self.history_host.append({"role": "assistant", "content": text})
-                return MessageType.TEXT, text
+                print("(generation)", text)
+                return [(MessageType.TEXT, text)]
         except Exception as e:
             print("error:", e)
-            return MessageType.NONE, None
+            return [(MessageType.NONE, None)]
 
-    def process_chat(self, message: Message) -> tuple[MessageType, Any]:
-        if message.message_type != MessageType.TEXT:
-            return MessageType.NONE, None
+    def process_chat(self, type: MessageType, content: Any) -> list[tuple[MessageType, Any]]:
+        if type != MessageType.TEXT:
+            return [(MessageType.NONE, None)]
 
-        user, comment = message.content.split(":")
+        user, comment = content.split(":")
         self.history_chat[user].append({"role": "user", "content": comment.strip()})
         try:
             with torch.inference_mode():
@@ -101,10 +104,10 @@ class Phi4:
                 text = self.tokenizer.decode(out[0][len(inputs["input_ids"][0]) :], skip_special_tokens=True)
         except Exception as e:
             print("error:", e)
-            return MessageType.NONE, None
+            return [(MessageType.NONE, None)]
 
         self.history_host.append({"role": "assistant", "content": text})
-        return MessageType.TEXT, text
+        return [(MessageType.TEXT, text)]
 
 
 class Phi4Multimodal(Phi4):
@@ -121,15 +124,15 @@ class Phi4Multimodal(Phi4):
         self.processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True, use_fast=True)
         self.audios: list[tuple[np.ndarray, int]] = []
 
-    def process_host(self, message: Message) -> tuple[MessageType, Any]:
-        match message.message_type:
+    def process_host(self, type: MessageType, content: Any) -> list[tuple[MessageType, Any]]:
+        match type:
             case MessageType.AUDIO:
-                self.audios.append(message.content)
+                self.audios.append(content)
                 self.history_host.append({"role": "user", "content": f"<|audio_{len(self.audios)}|>"})
             case MessageType.TEXT:
-                self.history_host.append({"role": "user", "content": message.content})
+                self.history_host.append({"role": "user", "content": content})
             case _:
-                return MessageType.NONE, None
+                return [(MessageType.NONE, None)]
 
         try:
             with torch.inference_mode():
@@ -149,7 +152,7 @@ class Phi4Multimodal(Phi4):
                 text = self.tokenizer.decode(out[0][len(inputs["input_ids"][0]) :], skip_special_tokens=True)
         except Exception as e:
             print("error:", e)
-            return MessageType.NONE, None
+            return [(MessageType.NONE, None)]
 
         self.history_host.append({"role": "assistant", "content": text})
-        return MessageType.TEXT, text
+        return [(MessageType.TEXT, text)]

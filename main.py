@@ -1,29 +1,27 @@
 import os
 import time
+from typing import Any
 
 import psutil
+import sounddevice as sd
 import torch
-from audio_modules import InputCapture, KokoroOutput, ParakeetConverter
-from messaging import Broker, MessageType, Sink
-from models import Phi4, Phi4Multimodal
-from module import Module
+from messaging import MessageType
+from models.asr.parakeet import Parakeet
+from models.llm.phi4 import Phi4
+from models.tts.kokoro82M import Kokoro82M
+from modules.audio_modules import InputDevice, OutputDevice
+from modules.basic_modules import BasicBroker, BasicProxy, BasicSink
 
 
-class TextOutput(Module, Sink):
-    def __init__(self, name: str):
-        Module.__init__(self, name=name)
-        Sink.__init__(self, name=name)
-
-    def run(self) -> None:
-        while self.is_running.is_set():
-            try:
-                _, _, message = self.sink_queue.get(timeout=0.1)
-                if message.message_type == MessageType.TEXT:
-                    print(message.content)
-            except Exception:
-                continue
-
-        print(f"[{self.name}] Broker stopped.")
+def simple_tts_output(type: MessageType, content: Any) -> None:
+    match type:
+        case MessageType.TEXT:
+            print("(Reading)", content)
+        case MessageType.AUDIO:
+            sd.play(content[0], content[1])
+            sd.wait()
+        case _:
+            pass
 
 
 if __name__ == "__main__":
@@ -33,6 +31,7 @@ if __name__ == "__main__":
     p.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
     torch.set_num_threads(len(affinities))
     torch.set_num_interop_threads(2)
+    # torch.cuda.set_stream(torch.cuda.Stream(priority=10))
 
     system_prompt_summary = """
     Ta tâche consiste à résumer notre conversation, en essayant de le faire de manière concise tout en conservant les détails les plus importants.
@@ -45,28 +44,39 @@ if __name__ == "__main__":
     Évite d'écrire des commentaires ou des questions sur la conversation.
     """
 
-    input_capture = InputCapture("input_capture", silence_threshold_db=-35)
-    parakeet_converter = ParakeetConverter("parakeet_converter")
-    input_capture.register_sink(parakeet_converter, MessageType.AUDIO)
+    asr = Parakeet()
     with open("assistant/system_prompt.txt") as f:
-        phi4_multimodal = Phi4(system_prompt_host=f.read(), context_size_limit=16384, system_prompt_summary=system_prompt_summary, device="cpu")
+        llm = Phi4(system_prompt_host=f.read(), max_new_tokens=512, context_size_limit=16384, system_prompt_summary=system_prompt_summary, device="cpu")
 
-    phi4_broker = Broker("phi4_broker")
+    tts = Kokoro82M(voice="ff_siwis")
+
+    input_device = InputDevice("input_device", silence_threshold_db=-35)
+    parakeet_converter = BasicProxy("parakeet_converter", asr.transcribe)
+    input_device.register_sink(parakeet_converter, MessageType.AUDIO)
+
+    phi4_broker = BasicBroker("phi4_broker")
     parakeet_converter.register_sink(phi4_broker, MessageType.TEXT)
-    kokoro_output = KokoroOutput("kokoro_output", "ff_siwis")
-    phi4_broker.register_route(parakeet_converter, kokoro_output, phi4_multimodal.process_host)
 
-    kokoro_output.start()
+    kokoro_converter = BasicProxy("kokoro_converter", tts.transcribe)
+    phi4_broker.register_route(parakeet_converter, kokoro_converter, llm.process_host)
+
+    output_device = BasicSink("output_device", simple_tts_output)
+    kokoro_converter.register_sink(output_device, MessageType.TEXT)
+    kokoro_converter.register_sink(output_device, MessageType.AUDIO)
+
+    output_device.start()
+    kokoro_converter.start()
     phi4_broker.start()
     parakeet_converter.start()
-    input_capture.start()
+    input_device.start()
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        input_capture.stop()
+        input_device.stop()
         parakeet_converter.stop()
         phi4_broker.stop()
-        kokoro_output.stop()
+        kokoro_converter.stop()
+        output_device.stop()
 
     print("done.")
